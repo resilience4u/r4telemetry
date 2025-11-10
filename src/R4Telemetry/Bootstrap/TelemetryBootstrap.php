@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace R4Telemetry\Bootstrap;
@@ -12,14 +13,17 @@ use OpenTelemetry\SDK\Resource\ResourceInfo;
 use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
 use OpenTelemetry\SDK\Trace\TracerProvider;
 use OpenTelemetry\SemConv\ResourceAttributes;
+use R4Telemetry\Integration\LoggerProvider;
+use Throwable;
 
 final class TelemetryBootstrap
 {
     private static ?TracerProvider $provider = null;
-    private static ?TracerInterface $tracer = null;
+    private static ?TracerInterface $tracer  = null;
 
     public static function init(array $opts = []): void
     {
+        $logger = LoggerProvider::get();
         $serviceName    = $opts['service_name']    ?? getenv('OTEL_SERVICE_NAME') ?? 'r4telemetry-app';
         $endpoint = $opts['endpoint']
             ?? getenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT')
@@ -36,39 +40,53 @@ final class TelemetryBootstrap
         $environment    = $opts['environment']     ?? (getenv('APP_ENV') ?: 'local');
         $autoFlush      = $opts['auto_flush']      ?? true;
 
-        $attributes = new Attributes([
-            ResourceAttributes::SERVICE_NAME => $serviceName,
-            ResourceAttributes::SERVICE_VERSION => $serviceVersion,
-            ResourceAttributes::DEPLOYMENT_ENVIRONMENT_NAME => $environment,
-        ], 0);
+        try {
+            $attributes = new Attributes([
+                ResourceAttributes::SERVICE_NAME => $serviceName,
+                ResourceAttributes::SERVICE_VERSION => $serviceVersion,
+                ResourceAttributes::DEPLOYMENT_ENVIRONMENT_NAME => $environment,
+            ], 0);
 
-        $resource = ResourceInfo::create($attributes);
+            $resource = ResourceInfo::create($attributes);
 
-        $transport = (new OtlpHttpTransportFactory())->create(
-            endpoint: $endpoint,
-            contentType: 'application/x-protobuf'
-        );
+            $transport = (new OtlpHttpTransportFactory())->create(
+                endpoint: $endpoint,
+                contentType: 'application/x-protobuf'
+            );
 
-        $exporter = (new SpanExporterFactory())->create($transport);
+            $exporter = (new SpanExporterFactory())->create($transport);
+            $clock = Clock::getDefault();
 
-        $clock = Clock::getDefault();
+            $processor = new BatchSpanProcessor(
+                exporter: $exporter,
+                clock: $clock,
+                maxQueueSize: BatchSpanProcessor::DEFAULT_MAX_QUEUE_SIZE,
+                scheduledDelayMillis: BatchSpanProcessor::DEFAULT_SCHEDULE_DELAY,
+                exportTimeoutMillis: BatchSpanProcessor::DEFAULT_EXPORT_TIMEOUT,
+                maxExportBatchSize: BatchSpanProcessor::DEFAULT_MAX_EXPORT_BATCH_SIZE,
+                autoFlush: $autoFlush
+            );
 
-        $processor = new BatchSpanProcessor(
-            exporter: $exporter,
-            clock: $clock,
-            maxQueueSize: BatchSpanProcessor::DEFAULT_MAX_QUEUE_SIZE,
-            scheduledDelayMillis: BatchSpanProcessor::DEFAULT_SCHEDULE_DELAY,
-            exportTimeoutMillis: BatchSpanProcessor::DEFAULT_EXPORT_TIMEOUT,
-            maxExportBatchSize: BatchSpanProcessor::DEFAULT_MAX_EXPORT_BATCH_SIZE,
-            autoFlush: $autoFlush
-        );
+            self::$provider = new TracerProvider(
+                spanProcessors: [$processor],
+                resource: $resource
+            );
 
-        self::$provider = new TracerProvider(
-            spanProcessors: [$processor],
-            resource: $resource
-        );
+            self::$tracer = self::$provider->getTracer($serviceName);
 
-        self::$tracer = self::$provider->getTracer($serviceName);
+            $logger->info('R4Telemetry initialized', [
+                'service'    => $serviceName,
+                'version'    => $serviceVersion,
+                'endpoint'   => $endpoint,
+                'environment' => $environment,
+                'auto_flush' => $autoFlush,
+            ]);
+        } catch (Throwable $e) {
+            $logger->error('Failed to initialize OpenTelemetry', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+        }
     }
 
     public static function provider(): TracerProvider
@@ -89,11 +107,14 @@ final class TelemetryBootstrap
 
     public static function shutdown(): void
     {
+        $logger = LoggerProvider::get();
         if (self::$provider) {
+            $logger->info('R4Telemetry shutting down...');
             self::$provider->forceFlush();
             self::$provider->shutdown();
         }
         self::$provider = null;
         self::$tracer = null;
+        $logger->info('R4Telemetry shutdown complete.');
     }
 }
